@@ -14,13 +14,40 @@ intended for upstream. See [Credits](#credits) for who made what.
 |---|---|
 | **Model** | GLM-5.3 by Z.ai, BF16 checkpoint, all 79 layers + the MTP layer |
 | **Quant** | EXL3 3.0 bpw (exllamav3 1.5.3), formula below |
-| **Engine** | TensorFold 0.6.0 + `glm-dsa-tp4` branch (24 commits) |
+| **Weights** | Our EXL3 3.0 bpw quant of [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3), GLM-5.3 License (Z.AI): [bertholomus/GLM-5.3-EXL3-3.0bpw](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) |
+| **Engine** | TensorFold 0.6.0 + `glm-dsa-tp4` branch (42 commits) |
 | **Hardware** | 4× GB10 (128 GB unified memory each), direct RoCE links, both 200G ports per node |
 | **Parallelism** | TP4, one rank per node; ~70 GiB weights per rank |
-| **Context** | 258,048 tokens |
-| **Status** | Working, measured. Quality (KLD vs BF16) not yet measured — see [Quality](#quality) |
+| **Context** | 1,048,576 tokens (the model's native window: Q5 cache + context parallelism over the 4 ranks) |
+| **Quality** | KL 0.109 vs BF16, top-1 agreement 90.2 % (exllamav3 `model_diff`, wikitext-2, 32 × 2,048) — see [Quality](#quality) |
 
-## Measured (2026-10-01, single stream, greedy)
+## Served configuration (2026-10-03, branch commit `1efdb17`)
+
+```
+TF_GLM_KV=q5 TF_GLM_EMBED_SPLIT=1 TF_GLM_DCP=4 TF_GLM_MTP_REUSE=2 \
+  bash scripts/tp4_start.sh 1048576 "--mtp-drafts 3"
+```
+
+- `TF_GLM_KV=q5`: latent cache in exllamav3's 5-bit MLA format, indexer keys FP8 (KL vs a bf16 cache 0.0095 at 32k).
+- `TF_GLM_EMBED_SPLIT=1`: the embedding split by vocabulary (1.33 GiB a rank back for cache).
+- `TF_GLM_DCP=4`: decode context parallelism, each rank holds a quarter of every cache plane; the design follows
+  TensorFold PR #159 by drowzeys, restated for this branch's kernels and cache formats.
+- `TF_GLM_MTP_REUSE=2`: the MTP draft layer reuses the main model's DSA token selection instead of rescoring.
+
+## Measured on the served configuration (2026-10-03, single stream, greedy, full clocks)
+
+- **Decode, MTP-3:** 34.6 / 40.6 / 42.1 / 38.1 tok/s on the four `bench/tf_greedy.py` prompts (client-side,
+  300-token replies). Token-identical to the serial reference on all four.
+- **Prefill:** 393 tok/s on a 129,837-token prompt (DCP4). Without DCP (replicated Q5 cache, ~544k window):
+  1,018 tok/s on a 35,742-token prompt.
+- **Long context:** needles found at 130,909 / 523,777 / 1,039,064 tokens at the 1M window (decode 29.2 / 28.6 /
+  24.5 tok/s at those depths; measured when DCP landed, `eb3a3a5`); the 130k needle re-found on the served commit.
+- **Gate (`bench/tf_bench.py`):** thinking answer correct, 13,265-token needle exact (318 tok/s incl. decode), tool
+  call well-formed.
+- **Concurrency (`--parallel 4`, replicated Q5, 131k a stream):** 57-63 tok/s aggregate, every reply equal to its
+  solo run. `--parallel` and DCP do not run together yet.
+
+## Measured (2026-10-01, single stream, greedy, 258K window, bf16 cache)
 
 All numbers come from the commit messages on the engine branch, where each change was gated on real runs.
 
@@ -91,13 +118,28 @@ OpenAI-compatible and has no authentication: keep it on loopback or put your own
 
 ## Quality
 
-KL divergence against BF16 has **not** been measured yet for this quant, so this repository makes no quality claim
-beyond the functional gate above. The KLD panel (exllamav3 `model_diff`, wikitext, 32 × 2048 tokens) is next, and a
-mixed per-expert formula is being researched as a second candidate. Results will be added here.
+KL divergence against the BF16 model, exllamav3 1.5.3 `eval/model_diff.py` (the converter's own harness), wikitext-2
+test split, 32 rows × 2,048 tokens (65,536 positions), BF16 activations, no cache quantization:
+
+| | value |
+|---|---|
+| KL(P_BF16 ‖ P_quant) (model_diff's first line) | **0.109** |
+| KL(P_quant ‖ P_BF16) | 0.123 |
+| Top-1 agreement with BF16 | **90.2 %** |
+| Perplexity, quant / BF16 | 2.911 / 2.750 (+5.9 %) |
+| Per-token KL, median / p90 | 0.014 / 0.259 |
+
+On the engine itself (the served prompt path scored against stored BF16 logits of the same panel): KL 0.111, top-1
+90.2 %. A longer panel (4 × 16,384 wikitext tokens, so DSA's top-2,048 selection is exercised): KL 0.119.
+
+Per-layer drift is smooth down the
+stack (no damaged layer from the resumed conversion). A mixed per-expert formula is being researched as a second
+candidate and will be measured on the same panel.
 
 ## Credits
 
-- **Z.ai** — GLM-5.3, the model and its weights. Use is subject to the GLM-5.3 license of the base model.
+- **Z.AI** — GLM-5.3, the model and its weights ([zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)). Our quant
+  is a derivative of their BF16 weights and stays under the GLM-5.3 License, Copyright (c) 2026 Z.AI.
 - **ashhart** — [TensorFold](https://github.com/ashhart/TensorFold) (Apache-2.0): the engine, the universal EXL3
   experts kernel, the `glm5_next` (GLM-5.3-Flash) family our `glm_moe_dsa` work builds on, and the TP machinery.
 - **turboderp** — [EXL3 / exllamav3](https://github.com/turboderp-org/exllamav3) (MIT): the quantization format and
@@ -105,6 +147,7 @@ mixed per-expert formula is being researched as a second candidate. Results will
 - **Projects whose published results shaped this work:** jayleaton
   ([glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark), TensorFold on GB10), vcruz305
   (EXL3 kernel work on GB10). No code from them is included here.
+- **drowzeys** — TensorFold PR #159 (decode context parallelism), whose design our `TF_GLM_DCP` follows.
 - **NVIDIA** — the PyTorch container and NCCL the ranks run on.
 - **BertholomusAI** (Albert Lee / [bertholomus](https://github.com/bertholomus)) — the quant formula and conversion,
   the `glm_moe_dsa` engine branch, the TP4 deployment and the measurements in this repository.
@@ -112,4 +155,4 @@ mixed per-expert formula is being researched as a second candidate. Results will
 ## License
 
 Recipe scripts and documentation: Apache-2.0 (see `LICENSE`), matching TensorFold. The model weights remain under
-Z.ai's GLM-5.3 license.
+Z.AI's GLM-5.3 License. Not affiliated with or endorsed by Z.AI, NVIDIA, the TensorFold authors or turboderp.

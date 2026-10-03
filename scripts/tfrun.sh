@@ -10,4 +10,5 @@ docker run -d --rm --name "$NAME" --gpus all --network host --ipc host --ulimit 
   -e PYTHONUNBUFFERED=1 -e TF_TP_WORLD=${TF_TP_WORLD:-1} -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-} \
   -e NCCL_IB_HCA=${NCCL_IB_HCA:-} -e NCCL_DEBUG=${NCCL_DEBUG:-WARN} -e NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-5} \
   -e NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-} -w /tfw \
+  $(env | grep -oE '^TF_GLM_[A-Z0-9_]+=' | tr -d = | sed 's/^/-e /') \
   nvcr.io/nvidia/pytorch:26.07-py3 bash -c "pip install --no-deps --no-build-isolation -q -e /tfw/TensorFold >/dev/null 2>&1; $*"

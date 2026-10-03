@@ -13,6 +13,8 @@ WORKDIR='~/glm53-tf'                         # holds TensorFold/ (branch glm-dsa
 M=/models/GLM-5.3-EXL3-3.0bpw                # checkpoint path inside the container (tfrun.sh mounts ~/models)
 
 CTX=${1:-32768}
+# the engine's TF_GLM_* settings in this shell (e.g. TF_GLM_KV=q5) go to every rank's container
+GLMENV=$(env | grep -E '^TF_GLM_[A-Z0-9_]+=[A-Za-z0-9_.,:+-]*$' | tr '\n' ' ')
 EXTRA=${2:---no-drafts}
 # Stop every rank's old lane first and let the nodes take the memory back: each rank's startup admission sizes the
 # cache from free memory, and a just-stopped lane still holding some of it costs ~10K tokens of window.
@@ -24,5 +26,5 @@ for r in 3 2 1 0; do
   else
     cmd="tensorfold serve $M --tp 4 --rank $r --master $MASTER --master-port 29661 $EXTRA --context $CTX"
   fi
-  ssh -o BatchMode=yes -n "${NODES[$r]}" "cd $WORKDIR && NCCL_SOCKET_IFNAME=$IFNAME NCCL_IB_HCA=${HCA[$r]} NCCL_NET_PLUGIN=spcx TF_TP_WORLD=4 ./tfrun.sh tf-tp4 \"$cmd\" >/dev/null && echo \$(hostname) rank $r started"
+  ssh -o BatchMode=yes -n "${NODES[$r]}" "cd $WORKDIR && NCCL_SOCKET_IFNAME=$IFNAME NCCL_IB_HCA=${HCA[$r]} NCCL_NET_PLUGIN=spcx $GLMENV TF_TP_WORLD=4 ./tfrun.sh tf-tp4 \"$cmd\" >/dev/null && echo \$(hostname) rank $r started"
 done
