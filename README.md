@@ -8,6 +8,12 @@ numbers. The engine is TensorFold, written by **ashhart**. Our engine changes fo
 fork, [bertholomus/TensorFold `glm-dsa-tp4`](https://github.com/bertholomus/TensorFold/tree/glm-dsa-tp4), and are
 intended for upstream. See [Credits](#credits) for who made what.
 
+> **Before you run this.** For most people, [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) is the better
+> everyday model: faster, with native vision. We built this for one reason, quality: as close to the full model as four
+> Sparks allow. This first release has **no vision**, and long prompts are slow (~400 tok/s prefill, ~76 s to the first
+> token at 32K). **No DFlash:** the only DFlash drafter for the full GLM-5.3 is CC BY-NC-ND 4.0, so we draft with
+> GLM-5.3's own MTP layer. That costs speed, not quality.
+
 > Hosts and addresses in this repository (`spark1`…`spark4`, `10.0.0.x`) are placeholders. Substitute your own.
 
 | | |
@@ -15,37 +21,57 @@ intended for upstream. See [Credits](#credits) for who made what.
 | **Model** | GLM-5.3 by Z.ai, BF16 checkpoint, all 79 layers + the MTP layer |
 | **Quant** | EXL3 3.0 bpw (exllamav3 1.5.3), formula below |
 | **Weights** | Our EXL3 3.0 bpw quant of [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3), GLM-5.3 License (Z.AI): [bertholomus/GLM-5.3-EXL3-3.0bpw](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) |
-| **Engine** | TensorFold 0.6.0 + `glm-dsa-tp4` branch (42 commits) |
+| **Engine** | TensorFold 0.6.0 + `glm-dsa-tp4` branch (release head `3eb35dd`) |
 | **Hardware** | 4× GB10 (128 GB unified memory each), direct RoCE links, both 200G ports per node |
 | **Parallelism** | TP4, one rank per node; ~70 GiB weights per rank |
 | **Context** | 1,048,576 tokens (the model's native window: Q5 cache + context parallelism over the 4 ranks) |
 | **Quality** | KL 0.109 vs BF16, top-1 agreement 90.2 % (exllamav3 `model_diff`, wikitext-2, 32 × 2,048) — see [Quality](#quality) |
 
-## Served configuration (2026-10-03, branch commit `1efdb17`)
+## Release numbers (2026-10-04, branch `glm-dsa-tp4` @ `3eb35dd`, 4× GB10, greedy, MTP-3)
+
+Two configurations from the same tree. Every number below is an HTTP measurement with the tools in `bench/`
+(prompt time included).
+
+**A. 4 streams, replicated cache** (up to 65,536 tokens a stream):
 
 ```
-TF_GLM_KV=q5 TF_GLM_EMBED_SPLIT=1 TF_GLM_DCP=4 TF_GLM_MTP_REUSE=2 \
-  bash scripts/tp4_start.sh 1048576 "--mtp-drafts 3"
+TF_GLM_KV=q5 TF_GLM_EMBED_SPLIT=1 TF_GLM_MTP_REUSE=2 \
+  bash scripts/tp4_start.sh 65536 "--mtp-drafts 3 --parallel 4"
 ```
 
+- 4 concurrent code streams: **82 tok/s aggregate**, first token 0.59–0.60 s
+- 4 concurrent chat streams: **71–73 tok/s aggregate**, first token 0.40–0.41 s
+- Greedy equality 4/4 against the serial reference
+
+**B. 1M window, 4 streams sharing one pool** (decode context parallelism over the four ranks):
+
+```
+TF_GLM_KV=q5 TF_GLM_EMBED_SPLIT=1 TF_GLM_DCP=4 TF_GLM_MTP_REUSE=2 TF_GLM_EXTENTS=1 \
+  bash scripts/tp4_start.sh 1048576 "--mtp-drafts 3 --parallel 4"
+```
+
+- 4 concurrent code streams: **~64 tok/s aggregate**, first token 0.28–1.10 s
+- 4 concurrent chat streams: **56 tok/s aggregate**, first token 0.22–0.82 s
+- Single stream: 33–39 tok/s (36.7–43.3 without `--parallel`)
+- Needle found at 1,039,064 tokens; prefill 402 tok/s at 32K, first token ~76 s at ~31K
+- Every concurrent reply bit-identical to its solo run (8/8 at 1, 2 and 4 streams); greedy equality 4/4
+
+Flags:
 - `TF_GLM_KV=q5`: latent cache in exllamav3's 5-bit MLA format, indexer keys FP8 (KL vs a bf16 cache 0.0095 at 32k).
 - `TF_GLM_EMBED_SPLIT=1`: the embedding split by vocabulary (1.33 GiB a rank back for cache).
 - `TF_GLM_DCP=4`: decode context parallelism, each rank holds a quarter of every cache plane; the design follows
   TensorFold PR #159 by drowzeys, restated for this branch's kernels and cache formats.
+- `TF_GLM_EXTENTS=1`: the 4 streams' windows as extents of one shared cache pool.
 - `TF_GLM_MTP_REUSE=2`: the MTP draft layer reuses the main model's DSA token selection instead of rescoring.
 
-## Measured on the served configuration (2026-10-03, single stream, greedy, full clocks)
+Heat: the 1M configuration runs the GB10s hot under long prefills (we saw 86 °C on one node). Give every node good
+airflow.
 
-- **Decode, MTP-3:** 34.6 / 40.6 / 42.1 / 38.1 tok/s on the four `bench/tf_greedy.py` prompts (client-side,
-  300-token replies). Token-identical to the serial reference on all four.
-- **Prefill:** 393 tok/s on a 129,837-token prompt (DCP4). Without DCP (replicated Q5 cache, ~544k window):
-  1,018 tok/s on a 35,742-token prompt.
-- **Long context:** needles found at 130,909 / 523,777 / 1,039,064 tokens at the 1M window (decode 29.2 / 28.6 /
-  24.5 tok/s at those depths; measured when DCP landed, `eb3a3a5`); the 130k needle re-found on the served commit.
-- **Gate (`bench/tf_bench.py`):** thinking answer correct, 13,265-token needle exact (318 tok/s incl. decode), tool
-  call well-formed.
-- **Concurrency (`--parallel 4`, replicated Q5, 131k a stream):** 57-63 tok/s aggregate, every reply equal to its
-  solo run. `--parallel` and DCP do not run together yet.
+## Earlier served configuration (2026-10-03, `1efdb17`)
+
+- **Decode, MTP-3:** 34.6 / 40.6 / 42.1 / 38.1 tok/s on the four `bench/tf_greedy.py` prompts.
+- **Prefill:** 393 tok/s on a 129,837-token prompt (DCP4); 1,018 tok/s on 35,742 tokens with a replicated cache.
+- **Long context:** needles found at 130,909 / 523,777 / 1,039,064 tokens at the 1M window.
 
 ## Measured (2026-10-01, single stream, greedy, 258K window, bf16 cache)
 
