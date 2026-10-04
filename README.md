@@ -21,11 +21,26 @@ intended for upstream. See [Credits](#credits) for who made what.
 | **Model** | GLM-5.3 by Z.ai, BF16 checkpoint, all 79 layers + the MTP layer |
 | **Quant** | EXL3 3.0 bpw (exllamav3 1.5.3), formula below |
 | **Weights** | Our EXL3 3.0 bpw quant of [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3), GLM-5.3 License (Z.AI): [bertholomus/GLM-5.3-EXL3-3.0bpw](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) |
-| **Engine** | TensorFold 0.6.0 + `glm-dsa-tp4` branch (release head `3eb35dd`) |
+| **Engine** | TensorFold 0.6.0 + `glm-dsa-tp4` branch (head `ddfad35`; release numbers measured on `3eb35dd`) |
 | **Hardware** | 4× GB10 (128 GB unified memory each), direct RoCE links, both 200G ports per node |
 | **Parallelism** | TP4, one rank per node; ~70 GiB weights per rank |
 | **Context** | 1,048,576 tokens (the model's native window: Q5 cache + context parallelism over the 4 ranks) |
 | **Quality** | KL 0.109 vs BF16, top-1 agreement 90.2 % (exllamav3 `model_diff`, wikitext-2, 32 × 2,048) — see [Quality](#quality) |
+
+## Update 2026-10-04 (branch `glm-dsa-tp4` @ `ddfad35`): stability and cold start
+
+Two engine fixes on top of `3eb35dd`. Output is unchanged: greedy equality 4/4 and every concurrent reply equals its
+solo run.
+
+- **RDMA fix (`cad0d2a`).** The decode all-gather matched receive completions to peers by QP number across both RDMA
+  devices. When two ports gave the same number to different peers, a start could fail with
+  `rdma gather: ibv_post_recv failed`. Completions are now matched on their own device only.
+- **No first-burst penalty (`4016d27`).** Concurrent decoding now captures every round and draft-step CUDA graph at
+  warm-up (50 graphs in 3.0 s) instead of during the first requests. The first 4 code requests after a start now run
+  at the steady rate (82.3 tok/s HTTP, config A), where before they paid 36 graph captures. `TF_GLM_PRECAPTURE=0`
+  restores the old behaviour.
+
+The release numbers below are unchanged.
 
 ## Release numbers (2026-10-04, branch `glm-dsa-tp4` @ `3eb35dd`, 4× GB10, greedy, MTP-3)
 
